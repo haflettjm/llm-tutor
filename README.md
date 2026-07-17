@@ -10,3 +10,5 @@ Neovim ────┘                    ├── embedded courses
 ```
 
 The tutor teaches through questions rather than supplying answers. Initial courses will be embedded in the server and available offline.
+
+Start with the [Programming Foundations syllabus](SYLLABUS.md).
