@@ -1,40 +1,54 @@
 package tutor
 
 import (
-	"context"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/haflettjm/llm-tutor/internal/progress"
+	"github.com/haflettjm/llm-tutor/internal/types"
 )
 
-func TestHandleStub(t *testing.T) {
+func TestLoadSouls(t *testing.T) {
 	dir := t.TempDir()
-
-	if err := os.WriteFile(filepath.Join(dir, "MENTOR.md"), []byte("# test mentor"), 0644); err != nil {
-		t.Fatal(err)
-	}
 	soulsDir := filepath.Join(dir, "souls")
 	if err := os.MkdirAll(soulsDir, 0755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(soulsDir, "concepts-tutor.md"), []byte("# test soul"), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(soulsDir, "concepts-tutor.md"), []byte("# test"), 0644); err != nil {
 		t.Fatal(err)
 	}
 
-	tutor, err := New("test-key", filepath.Join(dir, "MENTOR.md"), soulsDir)
+	souls, err := loadSouls(soulsDir)
 	if err != nil {
-		t.Fatalf("New: %v", err)
+		t.Fatalf("loadSouls: %v", err)
+	}
+	if _, ok := souls["concepts-tutor"]; !ok {
+		t.Error("expected concepts-tutor soul to be loaded")
+	}
+}
+
+func TestSelectSoul(t *testing.T) {
+	dir := t.TempDir()
+
+	if err := os.WriteFile(filepath.Join(dir, "progress.json"),
+		[]byte(`{"concepts":{},"sessions":0}`+"\n"), 0644); err != nil {
+		t.Fatal(err)
 	}
 
-	resp, err := tutor.Handle(context.Background(), Request{
-		Message:   "what is a variable?",
-		Language:  "go",
-		SessionID: "test",
-	})
+	prog, err := progress.Load(filepath.Join(dir, "progress.json"))
 	if err != nil {
-		t.Fatalf("Handle: %v", err)
+		t.Fatal(err)
 	}
-	if resp.ResponseType == "" {
-		t.Error("ResponseType should not be empty")
+
+	tut := &Tutor{
+		cfg:      types.Config{DataDir: dir},
+		souls:    map[string]string{"concepts-tutor": "# soul content"},
+		progress: prog,
+	}
+
+	soul := tut.selectSoul()
+	if soul == "" {
+		t.Error("expected non-empty soul selection")
 	}
 }

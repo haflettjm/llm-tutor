@@ -6,81 +6,107 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/haflettjm/llm-tutor/internal/harness"
+	"github.com/haflettjm/llm-tutor/internal/progress"
+	"github.com/haflettjm/llm-tutor/internal/types"
 )
 
-// Request is what the editor plugin sends on every chat turn.
-type Request struct {
-	Message   string `json:"message"`
-	Diff      string `json:"diff"`
-	Language  string `json:"language"`
-	ConceptID string `json:"concept_id,omitempty"`
-	SessionID string `json:"session_id"`
-}
-
-// Response is what the backend returns to the editor plugin.
-type Response struct {
-	Message      string `json:"message"`
-	ResponseType string `json:"response_type"` // question, observation, hint, explanation
-	ConceptID    string `json:"concept_id,omitempty"`
-	HintLevel    int    `json:"hint_level"`
-}
-
-// Tutor holds the loaded teaching contract and souls.
+// Tutor composes the system prompt, manages the harness session,
+// and routes editor queries through it.
 type Tutor struct {
-	apiKey     string
-	mentorDoc  string
-	souls      map[string]string // soul name -> file content
+	cfg      types.Config
+	harness  harness.Harness
+	mentor   string
+	souls    map[string]string
+	progress *progress.Store
 }
 
-// New loads MENTOR.md and all soul files from disk.
-func New(apiKey, mentorPath, soulsDir string) (*Tutor, error) {
-	mentor, err := os.ReadFile(mentorPath)
+// New loads MENTOR.md and souls from the data directory, selects and starts the harness.
+func New(cfg types.Config, prog *progress.Store) (*Tutor, error) {
+	mentor, err := os.ReadFile(filepath.Join(cfg.DataDir, "MENTOR.md"))
 	if err != nil {
-		return nil, fmt.Errorf("read %s: %w", mentorPath, err)
+		return nil, fmt.Errorf("read MENTOR.md: %w", err)
 	}
 
-	souls := make(map[string]string)
-	entries, err := os.ReadDir(soulsDir)
+	souls, err := loadSouls(filepath.Join(cfg.DataDir, "souls"))
 	if err != nil {
-		return nil, fmt.Errorf("read souls dir %s: %w", soulsDir, err)
+		return nil, err
+	}
+
+	h, err := harness.New(cfg.Harness)
+	if err != nil {
+		return nil, err
+	}
+
+	t := &Tutor{
+		cfg:      cfg,
+		harness:  h,
+		mentor:   string(mentor),
+		souls:    souls,
+		progress: prog,
+	}
+
+	if err := t.injectSystemPrompt(); err != nil {
+		return nil, fmt.Errorf("inject system prompt: %w", err)
+	}
+
+	if !h.IsRunning() {
+		if err := h.Start(context.Background(), cfg.MCPAddr); err != nil {
+			return nil, fmt.Errorf("start %s harness: %w", cfg.Harness, err)
+		}
+	}
+
+	return t, nil
+}
+
+// injectSystemPrompt composes MENTOR.md + the active soul and writes it to the
+// file the configured harness reads as its system instructions.
+func (t *Tutor) injectSystemPrompt() error {
+	soul := t.selectSoul()
+	var sb strings.Builder
+	sb.WriteString(t.mentor)
+	if soul != "" {
+		sb.WriteString("\n\n---\n\n")
+		sb.WriteString(soul)
+	}
+	return t.harness.WriteSystemPrompt(t.cfg.DataDir, sb.String())
+}
+
+// selectSoul picks the soul based on the learner's current concept track position.
+// Falls back to concepts-tutor when no better match is found.
+func (t *Tutor) selectSoul() string {
+	prog := t.progress.Get()
+	// Concept-to-soul mapping lives in the lesson plan; for now fall back to defaults.
+	switch prog.CurrentTrack {
+	default:
+		if soul, ok := t.souls["concepts-tutor"]; ok {
+			return soul
+		}
+	}
+	return ""
+}
+
+// Handle routes one editor turn through the harness and returns its response.
+func (t *Tutor) Handle(ctx context.Context, req types.Request) (types.Response, error) {
+	return t.harness.Query(ctx, req)
+}
+
+func loadSouls(dir string) (map[string]string, error) {
+	souls := make(map[string]string)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("read souls dir: %w", err)
 	}
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
 			continue
 		}
-		data, err := os.ReadFile(filepath.Join(soulsDir, e.Name()))
+		data, err := os.ReadFile(filepath.Join(dir, e.Name()))
 		if err != nil {
 			return nil, fmt.Errorf("read soul %s: %w", e.Name(), err)
 		}
-		name := strings.TrimSuffix(e.Name(), ".md")
-		souls[name] = string(data)
+		souls[strings.TrimSuffix(e.Name(), ".md")] = string(data)
 	}
-
-	return &Tutor{
-		apiKey:    apiKey,
-		mentorDoc: string(mentor),
-		souls:     souls,
-	}, nil
-}
-
-// selectSoul picks the right soul for the request.
-// Phase 4 implementation: map concept ID to soul, fall back to language/diff heuristics.
-func (t *Tutor) selectSoul(_ Request) string {
-	if soul, ok := t.souls["concepts-tutor"]; ok {
-		return soul
-	}
-	return ""
-}
-
-// Handle processes one tutor turn.
-// Phase 4 implementation: compose system prompt, call Anthropic API, parse response.
-func (t *Tutor) Handle(ctx context.Context, req Request) (Response, error) {
-	_ = t.mentorDoc
-	_ = t.selectSoul(req)
-	// TODO Phase 4: call Anthropic API with composed system prompt.
-	return Response{
-		Message:      "not implemented",
-		ResponseType: "question",
-		HintLevel:    0,
-	}, nil
+	return souls, nil
 }
