@@ -1,0 +1,17 @@
+# binary
+bin/
+/knumble-tutor
+
+# Go
+*.out
+coverage.html
+
+# socket
+*.sock
+
+# editors
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store

@@ -1,14 +1,31 @@
 # LLM Programming Tutor
 
-A Socratic programming tutor for Zed and Neovim.
+A Socratic programming tutor for Neovim (Zed planned). Teaches any language by asking questions rather than supplying answers.
 
 ```text
-Zed ───────┐
-           ├── LSP over stdio ── Go tutor server
-Neovim ────┘                    ├── embedded courses
-                                └── local progress
+Editor plugin ── HTTP / Unix socket ── Go backend
+(chat panel)                           ├── MENTOR.md  (universal teaching contract)
+                                       ├── souls/     (role-specific tutor personas)
+                                       ├── lesson-plans/
+                                       └── ~/.local/share/llm-tutor/
+                                           ├── learning-events.jsonl
+                                           └── progress.json
 ```
 
-The tutor teaches through questions rather than supplying answers. Initial courses will be embedded in the server and available offline.
+The editor plugin attaches the current git diff and detected language to every message. The backend selects the right soul file, composes the system prompt, and calls the Anthropic API.
 
-Start with the [Programming Foundations syllabus](SYLLABUS.md).
+## Setup
+
+```bash
+export ANTHROPIC_API_KEY=your_key_here
+make run
+```
+
+## Lesson plans
+
+- [Go Fundamentals](lesson-plans/go-fundamentals.md) — 10 concepts, entry level
+- [Python Foundations](lesson-plans/python-foundations.md) — 14 modules, entry level
+
+## Status
+
+Early scaffold. See the product plan in the Obsidian vault for the roadmap.
