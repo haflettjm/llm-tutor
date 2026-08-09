@@ -7,7 +7,7 @@ import (
 	"net/http"
 	"os"
 
-	"github.com/haflettjm/llm-programming-tutor/internal/tutor"
+	"github.com/haflettjm/llm-tutor/internal/tutor"
 )
 
 func main() {
