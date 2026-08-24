@@ -1,32 +1,40 @@
+// Package acpbridge adapts the tutor daemon to the Agent Client Protocol so
+// editors (Zed's agent panel, Neovim ACP clients) can drive it directly.
+//
+// The bridge is deliberately thin and stateless: it is spawned per workspace by
+// the editor and dies with the window, while the daemon it relays to outlives
+// both and owns all learner state.
 package acpbridge
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"net"
-	"net/http"
 	"strings"
+	"sync"
 
 	sdk "github.com/coder/acp-go-sdk"
 	"github.com/haflettjm/llm-tutor/internal/types/request"
-	"github.com/haflettjm/llm-tutor/internal/types/response"
 )
 
-type Query func(context.Context, request.Request) (response.Response, error)
-
+// Agent implements the ACP agent side.
 type Agent struct {
 	conn   *sdk.AgentSideConnection
-	query  Query
+	client Client
 	update func(context.Context, sdk.SessionNotification) error
+
+	// inflight lets session/cancel actually stop the turn it names, rather
+	// than acknowledging the cancel and letting the model run on.
+	mu       sync.Mutex
+	inflight map[sdk.SessionId]context.CancelFunc
 }
 
-func New(query Query) *Agent {
-	return &Agent{query: query}
+// New returns an Agent relaying to the given tutor daemon.
+func New(client Client) *Agent {
+	return &Agent{client: client, inflight: make(map[sdk.SessionId]context.CancelFunc)}
 }
 
 func (a *Agent) SetAgentConnection(conn *sdk.AgentSideConnection) {
@@ -49,14 +57,33 @@ func (a *Agent) Initialize(_ context.Context, params sdk.InitializeRequest) (sdk
 	}, nil
 }
 
-func (a *Agent) NewSession(_ context.Context, _ sdk.NewSessionRequest) (sdk.NewSessionResponse, error) {
+// NewSession mints a session id and publishes the command menu. The ACP
+// connection holds notifications sent from inside a request handler until the
+// response is written, so the client always has the session id before the
+// update naming it arrives.
+func (a *Agent) NewSession(ctx context.Context, _ sdk.NewSessionRequest) (sdk.NewSessionResponse, error) {
 	var id [16]byte
 	if _, err := rand.Read(id[:]); err != nil {
 		return sdk.NewSessionResponse{}, fmt.Errorf("create session id: %w", err)
 	}
-	return sdk.NewSessionResponse{SessionId: sdk.SessionId(hex.EncodeToString(id[:]))}, nil
+	sessionID := sdk.SessionId(hex.EncodeToString(id[:]))
+
+	if a.update != nil {
+		// A client that cannot render the menu is not a reason to fail the
+		// session -- every command also works as plain text.
+		_ = a.update(ctx, sdk.SessionNotification{
+			SessionId: sessionID,
+			Update: sdk.SessionUpdate{
+				AvailableCommandsUpdate: &sdk.SessionAvailableCommandsUpdate{
+					AvailableCommands: availableCommands(),
+				},
+			},
+		})
+	}
+	return sdk.NewSessionResponse{SessionId: sessionID}, nil
 }
 
+// Prompt handles one turn: a slash command, or a question for the tutor.
 func (a *Agent) Prompt(ctx context.Context, params sdk.PromptRequest) (sdk.PromptResponse, error) {
 	message := promptText(params.Prompt)
 	if message == "" {
@@ -66,20 +93,83 @@ func (a *Agent) Prompt(ctx context.Context, params sdk.PromptRequest) (sdk.Promp
 		return sdk.PromptResponse{}, fmt.Errorf("ACP connection is not ready")
 	}
 
-	resp, err := a.query(ctx, request.Request{
-		Message:   message,
-		SessionID: string(params.SessionId),
-	})
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	a.track(params.SessionId, cancel)
+	defer a.untrack(params.SessionId)
+
+	reply, err := a.respond(ctx, params.SessionId, message)
 	if err != nil {
+		if ctx.Err() != nil {
+			return sdk.PromptResponse{StopReason: sdk.StopReasonCancelled}, nil
+		}
+		// Surface the failure in the transcript as well as returning it: an
+		// editor that renders errors quietly would otherwise leave the learner
+		// staring at a prompt that did nothing.
+		_ = a.send(ctx, params.SessionId, "The tutor could not answer: "+err.Error())
 		return sdk.PromptResponse{}, err
 	}
-	if err := a.update(ctx, sdk.SessionNotification{
-		SessionId: params.SessionId,
-		Update:    sdk.UpdateAgentMessageText(resp.Message),
-	}); err != nil {
+
+	if err := a.send(ctx, params.SessionId, reply); err != nil {
 		return sdk.PromptResponse{}, err
 	}
 	return sdk.PromptResponse{StopReason: sdk.StopReasonEndTurn}, nil
+}
+
+// respond produces the reply text for one turn.
+func (a *Agent) respond(ctx context.Context, session sdk.SessionId, message string) (string, error) {
+	if cmd, args, ok := parseCommand(message); ok {
+		if cmd.local != nil {
+			return cmd.local(ctx, a, args)
+		}
+		message = cmd.directive(args)
+	}
+
+	resp, err := a.client.Query(ctx, request.Request{
+		Message:   message,
+		SessionID: string(session),
+	})
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(resp.Message) == "" {
+		return "", errors.New("the tutor returned an empty reply")
+	}
+	return resp.Message, nil
+}
+
+func (a *Agent) send(ctx context.Context, session sdk.SessionId, text string) error {
+	return a.update(ctx, sdk.SessionNotification{
+		SessionId: session,
+		Update:    sdk.UpdateAgentMessageText(text),
+	})
+}
+
+func (a *Agent) track(session sdk.SessionId, cancel context.CancelFunc) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	// A new prompt on a session supersedes whatever was still running on it.
+	if prev, ok := a.inflight[session]; ok {
+		prev()
+	}
+	a.inflight[session] = cancel
+}
+
+func (a *Agent) untrack(session sdk.SessionId) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	delete(a.inflight, session)
+}
+
+// Cancel stops the in-flight turn for a session, if there is one.
+func (a *Agent) Cancel(_ context.Context, params sdk.CancelNotification) error {
+	a.mu.Lock()
+	cancel, ok := a.inflight[params.SessionId]
+	a.mu.Unlock()
+	if ok {
+		cancel()
+	}
+	return nil
 }
 
 func promptText(blocks []sdk.ContentBlock) string {
@@ -96,10 +186,15 @@ func (a *Agent) Authenticate(context.Context, sdk.AuthenticateRequest) (sdk.Auth
 	return sdk.AuthenticateResponse{}, nil
 }
 
-func (a *Agent) Cancel(context.Context, sdk.CancelNotification) error { return nil }
-
-func (a *Agent) CloseSession(context.Context, sdk.CloseSessionRequest) (sdk.CloseSessionResponse, error) {
-	return sdk.CloseSessionResponse{}, sdk.NewMethodNotFound(sdk.AgentMethodSessionClose)
+func (a *Agent) CloseSession(_ context.Context, params sdk.CloseSessionRequest) (sdk.CloseSessionResponse, error) {
+	a.mu.Lock()
+	cancel, ok := a.inflight[params.SessionId]
+	delete(a.inflight, params.SessionId)
+	a.mu.Unlock()
+	if ok {
+		cancel()
+	}
+	return sdk.CloseSessionResponse{}, nil
 }
 
 func (a *Agent) ListSessions(context.Context, sdk.ListSessionsRequest) (sdk.ListSessionsResponse, error) {
@@ -122,45 +217,10 @@ func (a *Agent) SetSessionMode(context.Context, sdk.SetSessionModeRequest) (sdk.
 	return sdk.SetSessionModeResponse{}, sdk.NewMethodNotFound(sdk.AgentMethodSessionSetMode)
 }
 
-func Serve(query Query, stdout io.Writer, stdin io.Reader) {
-	agent := New(query)
+// Serve runs the ACP agent loop over stdio until the connection closes.
+func Serve(client Client, stdout io.Writer, stdin io.Reader) {
+	agent := New(client)
 	conn := sdk.NewAgentSideConnection(agent, stdout, stdin)
 	agent.SetAgentConnection(conn)
 	<-conn.Done()
-}
-
-func UnixSocketQuery(socket string) Query {
-	client := &http.Client{Transport: &http.Transport{
-		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			return (&net.Dialer{}).DialContext(ctx, "unix", socket)
-		},
-	}}
-
-	return func(ctx context.Context, req request.Request) (response.Response, error) {
-		body, err := json.Marshal(req)
-		if err != nil {
-			return response.Response{}, err
-		}
-		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://unix/tutor", bytes.NewReader(body))
-		if err != nil {
-			return response.Response{}, err
-		}
-		httpReq.Header.Set("Content-Type", "application/json")
-
-		httpResp, err := client.Do(httpReq)
-		if err != nil {
-			return response.Response{}, fmt.Errorf("connect to tutor daemon at %s: %w", socket, err)
-		}
-		defer httpResp.Body.Close()
-		if httpResp.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(io.LimitReader(httpResp.Body, 4096))
-			return response.Response{}, fmt.Errorf("tutor daemon returned %s: %s", httpResp.Status, strings.TrimSpace(string(body)))
-		}
-
-		var resp response.Response
-		if err := json.NewDecoder(httpResp.Body).Decode(&resp); err != nil {
-			return response.Response{}, fmt.Errorf("decode tutor response: %w", err)
-		}
-		return resp, nil
-	}
 }
