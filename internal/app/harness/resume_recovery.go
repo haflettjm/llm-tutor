@@ -1,5 +1,12 @@
 package harness
 
+import (
+	"context"
+	"errors"
+	"os/exec"
+	"strings"
+)
+
 // resumeRecovery is what the tutor does when it tries to continue an existing
 // conversation and the CLI refuses.
 type resumeRecovery int
@@ -19,6 +26,19 @@ const (
 	recoveryStartFreshAndNotify
 )
 
+// sessionGoneMarkers are the stderr phrases that positively identify "the
+// conversation you asked to resume does not exist". Claude Code 2.1 prints
+// "No conversation found with session ID: <uuid>"; the others are defensive
+// against wording drift across versions.
+var sessionGoneMarkers = []string{
+	"no conversation found",
+	"session not found",
+	"no such session",
+	"could not find session",
+	"session does not exist",
+	"unknown session id",
+}
+
 // decideResumeRecovery is called when `claude --resume <uuid>` exits non-zero.
 //
 // This happens for several different reasons, and they do NOT all deserve the
@@ -36,9 +56,40 @@ const (
 // err is the exec error (typically *exec.ExitError); stderr is what the CLI
 // printed, which is where the distinguishing detail lives.
 //
-// TODO(you): implement the policy. Returning recoveryFail for everything is the
-// conservative placeholder -- it never destroys a good session, but it means a
-// pruned session bricks the conversation until the learner starts a new one.
+// The policy is deliberately asymmetric. A missing session must be recognised
+// positively from stderr before we discard anything; every other failure --
+// including one we do not recognise at all -- preserves the conversation and
+// surfaces the error. Getting this wrong in the permissive direction silently
+// erases a learner's session; getting it wrong in the conservative direction
+// shows them one error they can retry past. Those costs are not symmetric.
+//
+// Exit codes cannot be used to discriminate: a pruned session and an unknown
+// CLI flag both exit 1.
 func decideResumeRecovery(err error, stderr string) resumeRecovery {
+	if err == nil {
+		return recoveryFail
+	}
+
+	// We cancelled the turn ourselves, or the process was signalled. The
+	// conversation is untouched and the caller already knows why.
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return recoveryFail
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ProcessState != nil {
+		if status, ok := exitErr.Sys().(interface{ Signaled() bool }); ok && status.Signaled() {
+			return recoveryFail
+		}
+	}
+
+	haystack := strings.ToLower(stderr)
+	for _, marker := range sessionGoneMarkers {
+		if strings.Contains(haystack, marker) {
+			return recoveryStartFreshAndNotify
+		}
+	}
+
+	// Anything else -- transient API failures, rate limits, our own bad flags,
+	// and messages we have never seen -- keeps the conversation.
 	return recoveryFail
 }

@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 
@@ -40,7 +41,11 @@ func newClaudeCode(dataDir string) *claudeCode {
 const responseSchema = `{"type":"object","properties":{"message":{"type":"string"},"response_type":{"type":"string","enum":["question","observation","hint","explanation"]},"hint_level":{"type":"integer","minimum":0,"maximum":3},"concept_id":{"type":"string"}},"required":["message","response_type","hint_level"]}`
 
 // allowedTools lists every MCP tool Claude may call during a tutor turn.
-const allowedTools = "mcp__llm-tutor__get_learner_context," +
+const allowedTools = "mcp__llm-tutor__start_session," +
+	"mcp__llm-tutor__get_learner_context," +
+	"mcp__llm-tutor__set_focus," +
+	"mcp__llm-tutor__set_soul," +
+	"mcp__llm-tutor__set_lesson_plan," +
 	"mcp__llm-tutor__update_concept_state," +
 	"mcp__llm-tutor__get_next_concept," +
 	"mcp__llm-tutor__list_lesson_plans," +
@@ -97,7 +102,9 @@ func (c *claudeCode) Query(ctx context.Context, req request.Request) (response.R
 	out, stderr, err := c.run(ctx, args, prompt)
 
 	if err != nil && resuming {
-		recovery := decideResumeRecovery(err, stderr)
+		// The CLI reports some failures only on stdout, so both streams are
+		// searched for the "session is gone" signal.
+		recovery := decideResumeRecovery(err, stderr+"\n"+envelopeDetail(out))
 		switch recovery {
 		case recoveryStartFresh, recoveryStartFreshAndNotify:
 			notify := recovery == recoveryStartFreshAndNotify
@@ -106,7 +113,7 @@ func (c *claudeCode) Query(ctx context.Context, req request.Request) (response.R
 			freshArgs, _ := c.sessionArgs(req.SessionID)
 			out, stderr, err = c.run(ctx, freshArgs, prompt)
 			if err != nil {
-				return response.Response{}, fmt.Errorf("claude query after restarting session: %w: %s", err, strings.TrimSpace(stderr))
+				return response.Response{}, claudeError("claude query after restarting session", err, out, stderr)
 			}
 			resp, parseErr := parseClaudeOutput(out)
 			if parseErr != nil {
@@ -122,7 +129,7 @@ func (c *claudeCode) Query(ctx context.Context, req request.Request) (response.R
 	}
 
 	if err != nil {
-		return response.Response{}, fmt.Errorf("claude query: %w: %s", err, strings.TrimSpace(stderr))
+		return response.Response{}, claudeError("claude query", err, out, stderr)
 	}
 	return parseClaudeOutput(out)
 }
@@ -147,6 +154,80 @@ func (c *claudeCode) run(ctx context.Context, sessionArgs []string, prompt strin
 
 	err = cmd.Run()
 	return outBuf.Bytes(), errBuf.String(), err
+}
+
+// claudeError builds the most informative error available for a failed run.
+//
+// The CLI reports model- and API-level failures as a JSON envelope on STDOUT
+// and exits non-zero with nothing on stderr at all. Reporting only the exit
+// status in that case produces "exit status 1: " -- an error with no
+// information in it, which is the worst possible thing to hand someone at
+// 2am. stdout is checked first because when it has something, it is the
+// actual reason.
+func claudeError(action string, err error, out []byte, stderr string) error {
+	if detail := envelopeDetail(out); detail != "" {
+		return fmt.Errorf("%s: %w: %s", action, err, detail)
+	}
+	if s := strings.TrimSpace(stderr); s != "" {
+		return fmt.Errorf("%s: %w: %s", action, err, s)
+	}
+	return fmt.Errorf("%s: %w (the CLI wrote nothing to stdout or stderr)", action, err)
+}
+
+// envelopeDetail extracts a human-readable reason from a CLI result envelope,
+// or "" when there is nothing useful in it.
+func envelopeDetail(raw []byte) string {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 {
+		return ""
+	}
+	if line := bytes.LastIndexByte(raw, '\n'); line >= 0 {
+		raw = bytes.TrimSpace(raw[line+1:])
+	}
+
+	var env struct {
+		Type     string          `json:"type"`
+		Subtype  string          `json:"subtype"`
+		IsError  bool            `json:"is_error"`
+		Error    string          `json:"error"`
+		Terminal string          `json:"terminal_reason"`
+		APIError string          `json:"api_error_status"`
+		Result   json.RawMessage `json:"result"`
+	}
+	if json.Unmarshal(raw, &env) != nil {
+		// Not JSON at all -- surface a bounded snippet rather than nothing.
+		const max = 300
+		if len(raw) > max {
+			raw = raw[:max]
+		}
+		return strings.TrimSpace(string(raw))
+	}
+
+	// A run the CLI itself considers successful carries no failure detail, even
+	// though the process exited non-zero for some other reason.
+	if !env.IsError && (env.Subtype == "" || env.Subtype == "success") {
+		return ""
+	}
+
+	var parts []string
+	for _, v := range []string{env.Error, env.APIError} {
+		if v = strings.TrimSpace(v); v != "" {
+			parts = append(parts, v)
+		}
+	}
+	if v := strings.TrimSpace(env.Terminal); v != "" && v != "completed" {
+		parts = append(parts, v)
+	}
+	if env.Subtype != "" && env.Subtype != "success" {
+		parts = append(parts, "subtype="+env.Subtype)
+	}
+	if len(parts) == 0 {
+		var msg string
+		if json.Unmarshal(env.Result, &msg) == nil && strings.TrimSpace(msg) != "" {
+			parts = append(parts, strings.TrimSpace(msg))
+		}
+	}
+	return strings.Join(parts, "; ")
 }
 
 // parseClaudeOutput unwraps the CLI JSON envelope and returns the typed response.
@@ -213,7 +294,17 @@ func buildPrompt(req request.Request) string {
 	return sb.String()
 }
 
-// registerClaudeMCP writes the tutor MCP server entry into ~/.claude.json.
+// mcpServerName is the key our entry occupies in ~/.claude.json.
+const mcpServerName = "llm-tutor"
+
+// registerClaudeMCP points Claude Code at our MCP server by writing one entry
+// into ~/.claude.json.
+//
+// That file is shared with every Claude Code session on this machine and holds
+// far more than MCP config, so this is deliberately careful: unknown keys are
+// preserved verbatim as raw JSON, the write is skipped entirely when our entry
+// is already correct, and the replacement goes through a temp file and a rename
+// so a crash mid-write cannot truncate the learner's settings.
 func registerClaudeMCP(mcpAddr string) error {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -221,33 +312,74 @@ func registerClaudeMCP(mcpAddr string) error {
 	}
 	path := filepath.Join(home, ".claude.json")
 
-	var root map[string]json.RawMessage
-	if data, err := os.ReadFile(path); err == nil {
-		_ = json.Unmarshal(data, &root)
-	}
-	if root == nil {
-		root = make(map[string]json.RawMessage)
+	root := make(map[string]json.RawMessage)
+	data, readErr := os.ReadFile(path)
+	if readErr == nil && len(bytes.TrimSpace(data)) > 0 {
+		if err := json.Unmarshal(data, &root); err != nil {
+			return fmt.Errorf("parse %s: %w -- refusing to overwrite it", path, err)
+		}
+	} else if readErr != nil && !os.IsNotExist(readErr) {
+		return fmt.Errorf("read %s: %w", path, readErr)
 	}
 
-	servers := map[string]any{
-		"llm-tutor": map[string]string{
-			"type": "sse",
-			"url":  "http://localhost" + mcpAddr + "/sse",
-		},
+	entry, err := json.Marshal(map[string]string{
+		"type": "sse",
+		"url":  mcpEndpoint(mcpAddr),
+	})
+	if err != nil {
+		return err
 	}
+
+	servers := make(map[string]json.RawMessage)
 	if existing, ok := root["mcpServers"]; ok {
-		var prev map[string]json.RawMessage
-		if err := json.Unmarshal(existing, &prev); err == nil {
-			for k, v := range prev {
-				if k != "llm-tutor" {
-					servers[k] = v
-				}
-			}
+		if err := json.Unmarshal(existing, &servers); err != nil {
+			return fmt.Errorf("parse mcpServers in %s: %w", path, err)
 		}
 	}
+	if cur, ok := servers[mcpServerName]; ok && sameJSON(cur, entry) {
+		return nil // already registered at this address
+	}
+	servers[mcpServerName] = entry
 
-	raw, _ := json.Marshal(servers)
+	raw, err := json.Marshal(servers)
+	if err != nil {
+		return err
+	}
 	root["mcpServers"] = raw
-	out, _ := json.MarshalIndent(root, "", "  ")
-	return os.WriteFile(path, append(out, '\n'), 0644)
+
+	out, err := json.MarshalIndent(root, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := path + ".llm-tutor.tmp"
+	if err := os.WriteFile(tmp, append(out, '\n'), 0600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+// mcpEndpoint turns a listen address into the URL the harness dials. A bare
+// ":7890" listens on every interface but must be dialled on a concrete host.
+func mcpEndpoint(addr string) string {
+	host, port := addr, ""
+	if i := strings.LastIndex(addr, ":"); i >= 0 {
+		host, port = addr[:i], addr[i+1:]
+	}
+	if host == "" || host == "0.0.0.0" || host == "[::]" {
+		host = "localhost"
+	}
+	if port == "" {
+		return "http://" + host + "/sse"
+	}
+	return "http://" + host + ":" + port + "/sse"
+}
+
+// sameJSON compares two JSON documents by value, so key order or whitespace
+// differences do not trigger a pointless rewrite of a shared settings file.
+func sameJSON(a, b []byte) bool {
+	var av, bv any
+	if json.Unmarshal(a, &av) != nil || json.Unmarshal(b, &bv) != nil {
+		return false
+	}
+	return reflect.DeepEqual(av, bv)
 }
