@@ -26,7 +26,7 @@ type Note struct {
 // *Pad satisfies this interface; tests can substitute a fake.
 type Repo interface {
 	Get() Scratchpad
-	Append(turn int, content string) error
+	Append(sessionID string, turn int, content string) error
 	Clear(sessionID string) error
 }
 
@@ -55,9 +55,18 @@ func (p *Pad) Get() Scratchpad {
 	return p.data
 }
 
-func (p *Pad) Append(turn int, content string) error {
+// Append records a note. A note arriving for a different session than the pad
+// currently holds starts a fresh pad: the scratchpad is the tutor's working
+// memory for one session, and mixing two sessions' notes is worse than losing
+// the older set, which the session note already summarises.
+func (p *Pad) Append(sessionID string, turn int, content string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
+	if sessionID != "" && p.data.SessionID != sessionID {
+		now := time.Now().UTC().Format(time.RFC3339)
+		p.data = Scratchpad{SessionID: sessionID, StartedAt: now, UpdatedAt: now, Notes: []Note{}}
+	}
 	p.data.Turn = turn
 	p.data.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
 	p.data.Notes = append(p.data.Notes, Note{

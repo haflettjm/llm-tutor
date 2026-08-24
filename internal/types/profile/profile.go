@@ -18,8 +18,8 @@ type LearnerProfile struct {
 	WhyLearning string `json:"why_learning"`
 
 	Context  WorkingContext `json:"context"`
-	Style    WorkingStyle  `json:"style"`
-	Sessions []SessionNote `json:"sessions"` // capped at 30
+	Style    WorkingStyle   `json:"style"`
+	Sessions []SessionNote  `json:"sessions"` // capped at 30
 }
 
 type WorkingContext struct {
