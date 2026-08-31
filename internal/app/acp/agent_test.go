@@ -50,6 +50,17 @@ func (f *fakeClient) Query(ctx context.Context, req request.Request) (response.R
 	return f.resp, f.queryErr
 }
 
+func (f *fakeClient) QueryStream(ctx context.Context, req request.Request, onChunk func(string, bool) error) (response.Response, error) {
+	resp, err := f.Query(ctx, req)
+	if err != nil {
+		return response.Response{}, err
+	}
+	if err := onChunk(resp.Message, false); err != nil {
+		return response.Response{}, err
+	}
+	return resp, nil
+}
+
 func (f *fakeClient) Progress(context.Context) (status.Progress, error) { return f.progress, nil }
 func (f *fakeClient) Plans(context.Context) (status.Plans, error)       { return f.plans, nil }
 func (f *fakeClient) SetTrack(_ context.Context, track string) (status.Progress, error) {

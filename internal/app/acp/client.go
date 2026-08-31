@@ -1,6 +1,7 @@
 package acpbridge
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -22,6 +23,7 @@ import (
 // an API call to read a JSON file.
 type Client interface {
 	Query(ctx context.Context, req request.Request) (response.Response, error)
+	QueryStream(ctx context.Context, req request.Request, onChunk func(text string, reset bool) error) (response.Response, error)
 	Progress(ctx context.Context) (status.Progress, error)
 	Plans(ctx context.Context) (status.Plans, error)
 	SetTrack(ctx context.Context, track string) (status.Progress, error)
@@ -49,6 +51,76 @@ func (c *httpClient) Query(ctx context.Context, req request.Request) (response.R
 	var out response.Response
 	err := c.do(ctx, http.MethodPost, "/tutor", req, &out)
 	return out, err
+}
+
+func (c *httpClient) QueryStream(ctx context.Context, in request.Request, onChunk func(string, bool) error) (response.Response, error) {
+	data, err := json.Marshal(in)
+	if err != nil {
+		return response.Response{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://unix/tutor/stream", bytes.NewReader(data))
+	if err != nil {
+		return response.Response{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return response.Response{}, fmt.Errorf("connect to tutor daemon at %s: %w", c.socket, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return response.Response{}, fmt.Errorf("tutor daemon returned %s", resp.Status)
+	}
+	return parseSSE(resp.Body, onChunk)
+}
+
+func parseSSE(r io.Reader, onChunk func(string, bool) error) (response.Response, error) {
+	var event, data string
+	s := bufio.NewScanner(r)
+	for s.Scan() {
+		line := s.Text()
+		if line == "" {
+			out, err := handleSSE(event, data, onChunk)
+			if err != nil {
+				return response.Response{}, err
+			}
+			if event == "done" {
+				return out, nil
+			}
+			event, data = "", ""
+			continue
+		}
+		if after, ok := strings.CutPrefix(line, "event: "); ok {
+			event = after
+		}
+		if after, ok := strings.CutPrefix(line, "data: "); ok {
+			data = after
+		}
+	}
+	return response.Response{}, s.Err()
+}
+
+func handleSSE(event, data string, onChunk func(string, bool) error) (response.Response, error) {
+	switch event {
+	case "chunk":
+		var chunk struct {
+			Text string `json:"text"`
+		}
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			return response.Response{}, err
+		}
+		return response.Response{}, onChunk(chunk.Text, false)
+	case "reset":
+		return response.Response{}, onChunk("", true)
+	case "done":
+		var out response.Response
+		return out, json.Unmarshal([]byte(data), &out)
+	case "error":
+		var out status.Error
+		_ = json.Unmarshal([]byte(data), &out)
+		return response.Response{}, fmt.Errorf("tutor daemon: %s", out.Error)
+	}
+	return response.Response{}, nil
 }
 
 func (c *httpClient) Progress(ctx context.Context) (status.Progress, error) {
