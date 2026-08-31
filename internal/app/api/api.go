@@ -7,11 +7,14 @@
 package api
 
 import (
+	"encoding/json"
+	"fmt"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
+	"github.com/haflettjm/llm-tutor/internal/app/harness"
 	"github.com/haflettjm/llm-tutor/internal/app/tutor"
 	typeconfig "github.com/haflettjm/llm-tutor/internal/types/config"
 	"github.com/haflettjm/llm-tutor/internal/types/lesson"
@@ -50,6 +53,7 @@ func Router(d Deps) *gin.Engine {
 	r.Use(requestLog(d.Log), gin.Recovery())
 
 	r.POST("/tutor", d.handleTutor)
+	r.POST("/tutor/stream", d.handleTutorStream)
 	r.GET("/health", d.handleHealth)
 	r.GET("/progress", d.handleProgress)
 	r.GET("/plans", d.handlePlans)
@@ -70,6 +74,42 @@ func (d Deps) handleTutor(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, resp)
+}
+
+func (d Deps) handleTutorStream(c *gin.Context) {
+	var req request.Request
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, status.Error{Error: err.Error()})
+		return
+	}
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("X-Accel-Buffering", "no")
+	c.Status(http.StatusOK)
+
+	send := func(event string, payload any) error {
+		data, err := json.Marshal(payload)
+		if err != nil {
+			return err
+		}
+		if _, err := fmt.Fprintf(c.Writer, "event: %s\ndata: %s\n\n", event, data); err != nil {
+			return err
+		}
+		c.Writer.Flush()
+		return nil
+	}
+	resp, err := d.Tutor.HandleStream(c.Request.Context(), req, func(ch harness.StreamChunk) error {
+		if ch.Reset {
+			return send("reset", struct{}{})
+		}
+		return send("chunk", map[string]string{"text": ch.Text})
+	})
+	if err != nil {
+		d.Log.Error("tutor stream", zap.Error(err))
+		_ = send("error", status.Error{Error: err.Error()})
+		return
+	}
+	_ = send("done", resp)
 }
 
 func (d Deps) handleHealth(c *gin.Context) {
