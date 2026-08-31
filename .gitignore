@@ -1,20 +1,57 @@
 # binary
 bin/
 /knumble-tutor
+/knumble-acp
 
 # Go
 *.out
+*.test
+*.prof
 coverage.html
 
 # socket
 *.sock
+
+# Credentials. This repository is public: nothing that authenticates
+# anything should ever be committable by accident.
+.env
+.env.*
+!.env.example
+*.pem
+*.p12
+*.key
+id_rsa
+id_ed25519
+
+# Learner state.
+# LLM_TUTOR_DATA can point the data dir at any path, including this checkout,
+# in which case the daemon writes these files here on first run. They hold a
+# real person's learning history, so they are anchored to the repo root and
+# kept out of git. The seed copies under internal/app/content/ are unaffected.
+/config.json
+/progress.json
+/learner-profile.json
+/learning-events.jsonl
+/scratchpad.json
+/.seeded.json
+/lesson-plans/
+/souls/
+/MENTOR.md
+# CLAUDE.md is deliberately NOT ignored. The data dir seeds one, but it is
+# tutor instructions rather than personal state, and a contributor may well
+# want to commit an agent-instructions file at the root.
 
 # editors
 .idea/
 .vscode/
 *.swp
 *.swo
+*~
 .DS_Store
+Thumbs.db
+
+# local agent settings
+.claude/settings.local.json
 
 # Dolt database files (added by bd init)
 .dolt/
