@@ -28,6 +28,24 @@ type Harness interface {
 	SupportsResume() bool
 }
 
+// StreamChunk is one incremental piece of a tutor reply. Reset clears any text
+// already rendered for the current reply before appending Text.
+type StreamChunk struct {
+	Text  string
+	Reset bool
+}
+
+// Streamer is implemented by harnesses that can emit a tutor reply incrementally.
+type Streamer interface {
+	StreamQuery(ctx context.Context, req request.Request, emit func(StreamChunk) error) (response.Response, error)
+}
+
+// CanStream reports whether h supports incremental replies.
+func CanStream(h Harness) (Streamer, bool) {
+	s, ok := h.(Streamer)
+	return s, ok
+}
+
 // Base is embedded in every concrete harness. It provides shared state and default
 // implementations for IsRunning, WriteSystemPrompt, SupportsResume, and Stop.
 // Each harness only needs to implement Start and Query.
