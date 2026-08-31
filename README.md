@@ -64,6 +64,38 @@ entries and settings are preserved.
 That is all the setup there is. **You do not need to pick a lesson plan.**
 Open your editor and run the `start` command; the tutor works out the rest.
 
+## Keeping the daemon up
+
+That MCP registration is permanent, but the daemon is just a process. Every
+session that starts while it is down fails with `SSE error: Unable to connect`,
+which reads like broken config and is not — nothing is listening on 7890.
+
+Run it under systemd so the two lifetimes match:
+
+```bash
+make install-service
+```
+
+That installs the binaries, enables `knumble-tutor.service`, and starts it.
+It restarts on failure and comes back at login. To check it:
+
+```bash
+systemctl --user status knumble-tutor
+curl --unix-socket /tmp/llm-tutor.sock http://localhost/health
+```
+
+`make uninstall-service` reverses it.
+
+Two things worth knowing:
+
+- **Clients do not retry.** Claude Code gives up on an unreachable MCP server
+  after a few attempts at startup and does not reconnect. Starting the daemon
+  afterwards does not rescue a session that is already running — restart the
+  editor or CLI.
+- **Linger is off by default,** so the service starts at login rather than at
+  boot. If you need it up before anyone logs in (reaching it over SSH), run
+  `loginctl enable-linger "$USER"`.
+
 ## Editors
 
 ### Neovim

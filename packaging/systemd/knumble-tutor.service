@@ -1,0 +1,38 @@
+# knumble-tutor as a systemd user service.
+#
+# Install with `make install-service`, or by hand:
+#   install -m 0644 packaging/systemd/knumble-tutor.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now knumble-tutor
+#
+# Why this exists: starting the daemon writes a *permanent* MCP registration
+# into ~/.claude.json pointing at localhost:7890. If the daemon is not running,
+# every editor and CLI session that reads that registration fails with
+# "SSE error: Unable to connect" — a confusing error that looks like broken
+# config rather than a stopped process. The unit makes the daemon's lifetime
+# match the registration's.
+
+[Unit]
+Description=knumble-tutor (llm-tutor Socratic tutor daemon)
+Documentation=https://github.com/haflettjm/llm-tutor
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/knumble-tutor
+
+# The daemon calls exec.LookPath("claude") at startup and refuses to boot
+# without the harness CLI. systemd user units get a minimal PATH, so the
+# directories holding it have to be named explicitly. The mise shims path is
+# harmless when absent.
+Environment=PATH=%h/.local/bin:%h/.local/share/mise/shims:/usr/local/bin:/usr/bin:/bin
+
+Restart=always
+RestartSec=3
+
+# No ExecStartPre socket cleanup on purpose. listenSocket() already dials the
+# existing socket: a crash leftover is removed, a socket another daemon is
+# actively serving is a hard error. Blindly rm-ing here would delete a live
+# daemon's socket and let two daemons corrupt shared learner state.
+
+[Install]
+WantedBy=default.target
