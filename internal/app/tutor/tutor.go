@@ -23,6 +23,7 @@ const defaultSoul = "concepts-tutor"
 // Service is the interface through which the HTTP layer routes tutor requests.
 type Service interface {
 	Handle(ctx context.Context, req request.Request) (response.Response, error)
+	HandleStream(ctx context.Context, req request.Request, emit func(harness.StreamChunk) error) (response.Response, error)
 }
 
 // Tutor composes the system prompt, manages the harness session,
@@ -99,6 +100,41 @@ func (t *Tutor) Handle(ctx context.Context, req request.Request) (response.Respo
 	// on the next turn keeps what the daemon reports as active honest, and means
 	// the next turn starts with the prompt already correct.
 	// Best effort: a failure here must not cost the learner an answer they have.
+	if next, syncErr := t.syncSystemPrompt(); syncErr == nil {
+		t.setActiveSoul(next)
+	}
+	return resp, nil
+}
+
+func (t *Tutor) HandleStream(ctx context.Context, req request.Request, emit func(harness.StreamChunk) error) (response.Response, error) {
+	if req.Message == "" {
+		return response.Response{}, fmt.Errorf("request has no message")
+	}
+	soul, err := t.syncSystemPrompt()
+	if err != nil {
+		return response.Response{}, err
+	}
+	_ = t.progress.StartSession(req.SessionID)
+	if req.ConceptID == "" {
+		req.ConceptID = t.currentConceptID()
+	}
+
+	var resp response.Response
+	if streamer, ok := harness.CanStream(t.harness); ok {
+		resp, err = streamer.StreamQuery(ctx, req, emit)
+	} else {
+		resp, err = t.harness.Query(ctx, req)
+		if err == nil && emit != nil {
+			err = emit(harness.StreamChunk{Text: resp.Message})
+		}
+	}
+	if err != nil {
+		return response.Response{}, err
+	}
+	if resp.ConceptID == "" {
+		resp.ConceptID = req.ConceptID
+	}
+	t.setActiveSoul(soul)
 	if next, syncErr := t.syncSystemPrompt(); syncErr == nil {
 		t.setActiveSoul(next)
 	}

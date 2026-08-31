@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/haflettjm/llm-tutor/internal/app/harness"
 	typeconfig "github.com/haflettjm/llm-tutor/internal/types/config"
 	"github.com/haflettjm/llm-tutor/internal/types/lesson"
 	"github.com/haflettjm/llm-tutor/internal/types/profile"
@@ -31,6 +32,19 @@ type fakeTutor struct {
 func (f *fakeTutor) Handle(_ context.Context, req request.Request) (response.Response, error) {
 	f.req = req
 	return f.resp, f.err
+}
+
+func (f *fakeTutor) HandleStream(_ context.Context, req request.Request, emit func(harness.StreamChunk) error) (response.Response, error) {
+	f.req = req
+	if f.err != nil {
+		return response.Response{}, f.err
+	}
+	if emit != nil {
+		if err := emit(harness.StreamChunk{Text: f.resp.Message}); err != nil {
+			return response.Response{}, err
+		}
+	}
+	return f.resp, nil
 }
 
 type fakeProgress struct{ data progress.Progress }
