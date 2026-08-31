@@ -137,6 +137,76 @@ func (c *claudeCode) Query(ctx context.Context, req request.Request) (response.R
 // run invokes the claude CLI with the prompt on stdin. The prompt is deliberately
 // NOT passed as an argv string: a single argument is capped at MAX_ARG_STRLEN
 // (131072 bytes on Linux), which a large diff or a long replayed context exceeds.
+func (c *claudeCode) StreamQuery(ctx context.Context, req request.Request, emit func(StreamChunk) error) (response.Response, error) {
+	prompt := buildPrompt(req)
+	args, resuming := c.sessionArgs(req.SessionID)
+	resp, emitted, out, stderr, err := c.runStream(ctx, args, prompt, emit)
+	if err == nil {
+		return resp, nil
+	}
+	if !resuming {
+		return response.Response{}, claudeError("claude stream query", err, out, stderr)
+	}
+
+	recovery := decideResumeRecovery(err, stderr+"\n"+envelopeDetail(out))
+	if recovery == recoveryFail {
+		return response.Response{}, claudeError("claude stream query", err, out, stderr)
+	}
+	if emitted && emit != nil {
+		if err := emit(StreamChunk{Reset: true}); err != nil {
+			return response.Response{}, err
+		}
+	}
+	c.forgetSession(req.SessionID)
+	freshArgs, _ := c.sessionArgs(req.SessionID)
+	resp, _, out, stderr, err = c.runStream(ctx, freshArgs, prompt, emit)
+	if err != nil {
+		return response.Response{}, claudeError("claude stream query after restarting session", err, out, stderr)
+	}
+	if recovery == recoveryStartFreshAndNotify {
+		resp.Message = resumeNotice + resp.Message
+	}
+	return resp, nil
+}
+
+func (c *claudeCode) runStream(ctx context.Context, sessionArgs []string, prompt string, emit func(StreamChunk) error) (resp response.Response, emitted bool, out []byte, stderr string, err error) {
+	args := append([]string{"-p", "--verbose", "--output-format", "stream-json", "--include-partial-messages", "--json-schema", responseSchema, "--allowedTools", allowedTools}, sessionArgs...)
+	var errBuf bytes.Buffer
+	cmd := exec.CommandContext(ctx, "claude", args...)
+	cmd.Dir = c.dataDir
+	cmd.Stdin = strings.NewReader(prompt)
+	cmd.Stderr = &errBuf
+
+	pipe, err := cmd.StdoutPipe()
+	if err != nil {
+		return resp, false, nil, errBuf.String(), err
+	}
+	if err := cmd.Start(); err != nil {
+		return resp, false, nil, errBuf.String(), err
+	}
+	var scanner messageScanner
+	final, scanErr := scanStreamJSON(pipe, func(fragment string) error {
+		text := scanner.Feed(fragment)
+		if text == "" {
+			return nil
+		}
+		emitted = true
+		if emit == nil {
+			return nil
+		}
+		return emit(StreamChunk{Text: text})
+	})
+	waitErr := cmd.Wait()
+	if scanErr != nil {
+		return resp, emitted, final, errBuf.String(), scanErr
+	}
+	if waitErr != nil {
+		return resp, emitted, final, errBuf.String(), waitErr
+	}
+	resp, err = parseClaudeOutput(final)
+	return resp, emitted, final, errBuf.String(), err
+}
+
 func (c *claudeCode) run(ctx context.Context, sessionArgs []string, prompt string) (stdout []byte, stderr string, err error) {
 	args := append([]string{
 		"-p",

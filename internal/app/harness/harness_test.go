@@ -9,10 +9,10 @@ func TestCanStreamReportsFalseForNonStreamingHarness(t *testing.T) {
 	}
 }
 
-func TestCanStreamReportsFalseBeforeClaudeStreamingExists(t *testing.T) {
+func TestCanStreamReportsTrueForClaudeCode(t *testing.T) {
 	h := newClaudeCode(t.TempDir())
-	if _, ok := CanStream(h); ok {
-		t.Fatal("claude-code must not report streaming support before StreamQuery exists")
+	if _, ok := CanStream(h); !ok {
+		t.Fatal("claude-code must report streaming support")
 	}
 }
 
