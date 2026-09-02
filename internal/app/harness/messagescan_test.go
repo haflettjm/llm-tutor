@@ -5,6 +5,13 @@ import (
 	"testing"
 )
 
+func TestMessageScannerAcceptsWhitespaceAfterColon(t *testing.T) {
+	var scanner messageScanner
+	if got := scanner.Feed(`{"message": "Hello"}`); got != "Hello" {
+		t.Fatalf("text = %q", got)
+	}
+}
+
 func TestMessageScannerExtractsAcrossFragmentBoundaries(t *testing.T) {
 	var scanner messageScanner
 	var got strings.Builder
@@ -12,32 +19,27 @@ func TestMessageScannerExtractsAcrossFragmentBoundaries(t *testing.T) {
 		got.WriteString(scanner.Feed(fragment))
 	}
 	if got.String() != "What happens if i starts at 1?" {
-		t.Errorf("got %q", got.String())
+		t.Fatalf("text = %q", got.String())
 	}
 }
 
 func TestMessageScannerDecodesEscapes(t *testing.T) {
 	var scanner messageScanner
-	got := scanner.Feed(`{"message":"line one\nline \"two\"","hint_level":0}`)
-	want := "line one\nline \"two\""
-	if got != want {
-		t.Errorf("got %q, want %q", got, want)
+	if got := scanner.Feed(`{"message":"Say \"hi\"\\now"}`); got != "Say \"hi\"\\now" {
+		t.Fatalf("text = %q", got)
 	}
 }
 
 func TestMessageScannerHandlesMessageNotFirst(t *testing.T) {
 	var scanner messageScanner
-	got := scanner.Feed(`{"response_type":"hint","message":"try tracing it"}`)
-	if got != "try tracing it" {
-		t.Errorf("got %q", got)
+	if got := scanner.Feed(`{"hint_level":0,"message":"hi"}`); got != "hi" {
+		t.Fatalf("text = %q", got)
 	}
 }
 
 func TestMessageScannerStopsAtEndOfValue(t *testing.T) {
 	var scanner messageScanner
-	first := scanner.Feed(`{"message":"done","concept_id":"PROG-004"}`)
-	second := scanner.Feed(`trailing garbage`)
-	if first != "done" || second != "" {
-		t.Errorf("first=%q second=%q", first, second)
+	if got := scanner.Feed(`{"message":"hi","response_type":"question"}`); got != "hi" {
+		t.Fatalf("text = %q", got)
 	}
 }

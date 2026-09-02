@@ -5,11 +5,12 @@ import (
 	"strings"
 )
 
-const messagePrefix = `"message":"`
+const messagePrefix = `"message":`
 
 type messageScanner struct {
 	prefix        string
 	inValue       bool
+	started       bool
 	done          bool
 	escaped       bool
 	unicode       string
@@ -33,6 +34,19 @@ func (s *messageScanner) Feed(fragment string) string {
 		s.inValue = true
 		fragment = s.prefix[index+len(messagePrefix):]
 		s.prefix = ""
+	}
+
+	if !s.started {
+		fragment = strings.TrimLeft(fragment, " 	\r\n")
+		if fragment == "" {
+			return ""
+		}
+		if fragment[0] != '"' {
+			s.done = true
+			return ""
+		}
+		s.started = true
+		fragment = fragment[1:]
 	}
 
 	var text strings.Builder
