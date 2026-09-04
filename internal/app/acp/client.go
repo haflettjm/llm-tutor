@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/haflettjm/llm-tutor/internal/types/request"
 	"github.com/haflettjm/llm-tutor/internal/types/response"
@@ -41,10 +42,38 @@ func NewHTTPClient(socket string) Client {
 		socket: socket,
 		http: &http.Client{Transport: &http.Transport{
 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				return (&net.Dialer{}).DialContext(ctx, "unix", socket)
+				return dialWithRetry(ctx, (&net.Dialer{}).DialContext, "unix", socket)
 			},
 		}},
 	}
+}
+
+const (
+	dialAttempts  = 3
+	dialRetryWait = 200 * time.Millisecond
+)
+
+// dialWithRetry covers the brief gap while systemd restarts the local daemon.
+// It wraps only DialContext, never an HTTP request, so an accepted tutor turn is
+// not accidentally replayed and billed twice.
+func dialWithRetry(ctx context.Context, dial func(context.Context, string, string) (net.Conn, error), network, address string) (net.Conn, error) {
+	var lastErr error
+	for attempt := 1; attempt <= dialAttempts; attempt++ {
+		conn, err := dial(ctx, network, address)
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+		if attempt == dialAttempts {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("dial tutor daemon at %s: %w", address, ctx.Err())
+		case <-time.After(dialRetryWait):
+		}
+	}
+	return nil, fmt.Errorf("dial tutor daemon at %s: %w", address, lastErr)
 }
 
 func (c *httpClient) Query(ctx context.Context, req request.Request) (response.Response, error) {
