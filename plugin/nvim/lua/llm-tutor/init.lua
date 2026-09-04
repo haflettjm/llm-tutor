@@ -75,11 +75,51 @@ local function type_label(response_type)
   return labels[response_type] or response_type
 end
 
-local function show_response(resp)
+local function open_response_buffer()
   local max_w = math.min(80, vim.o.columns - 4)
-  local lines = {}
+  local lines = { "… Thinking", string.rep("─", max_w - 2), "" }
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
+  vim.api.nvim_set_option_value("filetype", "markdown", { buf = buf })
 
-  -- Header: response type + optional hint level
+  local height = math.min(#lines, math.floor(vim.o.lines * 0.6))
+  local win = vim.api.nvim_open_win(buf, true, {
+    relative  = "editor",
+    width     = math.max(40, #lines[2] + 2),
+    height    = height,
+    row       = math.floor((vim.o.lines - height) / 2),
+    col       = math.floor((vim.o.columns - math.max(40, #lines[2] + 2)) / 2),
+    style     = "minimal",
+    border    = "rounded",
+    title     = " knumble-tutor ",
+    title_pos = "center",
+  })
+
+  local close = function() vim.api.nvim_win_close(win, true) end
+  vim.keymap.set("n", "q", close, { buffer = buf, nowait = true })
+  vim.keymap.set("n", "<Esc>", close, { buffer = buf, nowait = true })
+  return { buf = buf, body = "", max_w = max_w }
+end
+
+local function render_response(handle, header)
+  if not vim.api.nvim_buf_is_valid(handle.buf) then return end
+  local lines = { header, string.rep("─", handle.max_w - 2) }
+  for _, line in ipairs(wrap_text(handle.body, handle.max_w - 2)) do
+    table.insert(lines, line)
+  end
+  vim.api.nvim_set_option_value("modifiable", true, { buf = handle.buf })
+  vim.api.nvim_buf_set_lines(handle.buf, 0, -1, false, lines)
+  vim.api.nvim_set_option_value("modifiable", false, { buf = handle.buf })
+end
+
+local function append_to_response(handle, text, reset)
+  handle.body = reset and "" or handle.body .. text
+  -- ponytail: re-wrap the whole small tutor reply; retain incremental line state if long replies become sluggish.
+  render_response(handle, "… Thinking")
+end
+
+local function finalize_response(handle, resp)
   local header = type_label(resp.response_type)
   if resp.hint_level and resp.hint_level > 0 then
     header = header .. string.format("  [level %d/3]", resp.hint_level)
@@ -87,43 +127,16 @@ local function show_response(resp)
   if resp.concept_id and resp.concept_id ~= "" then
     header = header .. "  " .. resp.concept_id
   end
-  table.insert(lines, header)
-  table.insert(lines, string.rep("─", max_w - 2))
-
-  -- Wrapped message body
-  for _, l in ipairs(wrap_text(resp.message, max_w - 2)) do
-    table.insert(lines, l)
+  if resp.message and resp.message ~= "" and handle.body == "" then
+    handle.body = resp.message
   end
+  render_response(handle, header)
+end
 
-  -- Size the window
-  local height = math.min(#lines, math.floor(vim.o.lines * 0.6))
-  local width = 0
-  for _, l in ipairs(lines) do
-    width = math.max(width, #l)
-  end
-  width = math.max(width + 2, 40)
-
-  local buf = vim.api.nvim_create_buf(false, true)
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-  vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
-  vim.api.nvim_set_option_value("filetype", "markdown", { buf = buf })
-
-  local win = vim.api.nvim_open_win(buf, true, {
-    relative  = "editor",
-    width     = width,
-    height    = height,
-    row       = math.floor((vim.o.lines - height) / 2),
-    col       = math.floor((vim.o.columns - width) / 2),
-    style     = "minimal",
-    border    = "rounded",
-    title     = " knumble-tutor ",
-    title_pos = "center",
-  })
-
-  -- q / Escape closes; scroll with j/k
-  local close = function() vim.api.nvim_win_close(win, true) end
-  vim.keymap.set("n", "q",     close, { buffer = buf, nowait = true })
-  vim.keymap.set("n", "<Esc>", close, { buffer = buf, nowait = true })
+local function show_response(resp)
+  local handle = open_response_buffer()
+  append_to_response(handle, resp.message or "")
+  finalize_response(handle, resp)
 end
 
 -- ── HTTP request over Unix socket ─────────────────────────────────────────────
@@ -190,14 +203,93 @@ local function request(method, path, body, on_ok)
   })
 end
 
+-- request_stream reads the daemon's one-line SSE events as curl receives them.
+-- curl -N is required, otherwise curl buffers the reply until the turn ends.
+local function request_stream(path, body, on_chunk, on_done, on_error)
+  local cmd = {
+    "curl", "-sfN", "--unix-socket", cfg.socket, "-X", "POST",
+    "-H", "Content-Type: application/json", "-d", vim.fn.json_encode(body),
+    "http://localhost" .. path,
+  }
+  local event, data, finished = nil, nil, false
+
+  vim.fn.jobstart(cmd, {
+    stdout_buffered = false,
+    on_stdout = function(_, lines)
+      for _, line in ipairs(lines) do
+        if vim.startswith(line, "event: ") then
+          event = line:sub(8)
+        elseif vim.startswith(line, "data: ") then
+          data = line:sub(7)
+        elseif line == "" and event and data then
+          local current_event, current_data = event, data
+          event, data = nil, nil
+          vim.schedule(function()
+            local ok, payload = pcall(vim.fn.json_decode, current_data)
+            if not ok then
+              on_error("invalid stream event from daemon")
+              return
+            end
+            if current_event == "chunk" then
+              on_chunk(payload.text or "")
+            elseif current_event == "reset" then
+              on_chunk("", true)
+            elseif current_event == "done" then
+              finished = true
+              on_done(payload)
+            elseif current_event == "error" then
+              finished = true
+              on_error(payload.error or "tutor stream failed")
+            end
+          end)
+        end
+      end
+    end,
+    on_stderr = function(_, lines)
+      for _, line in ipairs(lines) do
+        if line ~= "" then
+          vim.schedule(function() vim.notify("llm-tutor: " .. line, vim.log.levels.WARN) end)
+        end
+      end
+    end,
+    on_exit = function(_, code)
+      if code ~= 0 and not finished then
+        vim.schedule(function()
+          on_error(string.format("curl exited %d, is knumble-tutor running?", code))
+        end)
+      end
+    end,
+  })
+end
+
 local function do_query(message, diff)
   request("POST", "/tutor", {
-    message    = message,
-    diff       = diff or "",
-    language   = detect_language(),
+    message = message,
+    diff = diff or "",
+    language = detect_language(),
     concept_id = "",
     session_id = cfg.session_id,
   }, show_response)
+
+  vim.notify("Asking tutor…", vim.log.levels.INFO)
+end
+
+local function do_stream_query(message, diff)
+  local handle = open_response_buffer()
+  request_stream("/tutor/stream", {
+    message = message,
+    diff = diff or "",
+    language = detect_language(),
+    concept_id = "",
+    session_id = cfg.session_id,
+  }, function(text, reset)
+    append_to_response(handle, text, reset)
+  end, function(resp)
+    finalize_response(handle, resp)
+  end, function(err)
+    render_response(handle, "! Error")
+    vim.notify("llm-tutor: " .. err, vim.log.levels.ERROR)
+  end)
 
   vim.notify("Asking tutor…", vim.log.levels.INFO)
 end
@@ -267,11 +359,11 @@ end
 
 function M.ask(message)
   if message and message ~= "" then
-    do_query(message, nil)
+    do_stream_query(message, nil)
   else
     vim.ui.input({ prompt = "Ask tutor: " }, function(input)
       if input and input ~= "" then
-        do_query(input, nil)
+        do_stream_query(input, nil)
       end
     end)
   end
@@ -280,11 +372,11 @@ end
 function M.ask_with_diff(message)
   local diff = get_diff()
   if message and message ~= "" then
-    do_query(message, diff)
+    do_stream_query(message, diff)
   else
     vim.ui.input({ prompt = "Ask tutor (with diff): " }, function(input)
       if input and input ~= "" then
-        do_query(input, diff)
+        do_stream_query(input, diff)
       end
     end)
   end
