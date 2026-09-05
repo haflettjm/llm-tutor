@@ -3,8 +3,12 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
 
 	typeconfig "github.com/haflettjm/llm-tutor/internal/types/config"
 )
@@ -13,6 +17,26 @@ const (
 	defaultSocket  = "/tmp/llm-tutor.sock"
 	defaultMCPAddr = ":7890"
 )
+
+// resolveMCPAddr picks an available port, starting from defaultMCPAddr.
+// If the default is unavailable, it increments the port number.
+func resolveMCPAddr(addr string) string {
+	base, _ := strconv.Atoi(strings.TrimPrefix(addr, ":"))
+	for i := 0; i < 10; i++ {
+		port := base + i
+		testAddr := ":" + strconv.Itoa(port)
+		if !portInUse(testAddr) {
+			return testAddr
+		}
+	}
+	// Fallback: return original if nothing available
+	return addr
+}
+
+func portInUse(addr string) bool {
+	_, err := net.DialTimeout("tcp", addr, 100*time.Millisecond)
+	return err == nil
+}
 
 // Load reads ~/Documents/llm-tutor/config.json.
 // On first run (file absent) it seeds a template and returns an error
@@ -50,6 +74,7 @@ func Load() (typeconfig.Config, error) {
 	if cfg.Socket == "" {
 		cfg.Socket = defaultSocket
 	}
+	cfg.MCPAddr = resolveMCPAddr(cfg.MCPAddr)
 	if cfg.MCPAddr == "" {
 		cfg.MCPAddr = defaultMCPAddr
 	}
@@ -68,6 +93,13 @@ func resolveDataDir() string {
 func seedTemplate(dataDir, path string) error {
 	if err := os.MkdirAll(dataDir, 0755); err != nil {
 		return err
+	}
+	// Ensure subdirectories exist
+	_subdirs := []string{"souls", "lesson-plans"}
+	for _, d := range _subdirs {
+		if err := os.MkdirAll(filepath.Join(dataDir, d), 0755); err != nil {
+			return err
+		}
 	}
 	if _, err := os.Stat(path); err == nil {
 		return nil
